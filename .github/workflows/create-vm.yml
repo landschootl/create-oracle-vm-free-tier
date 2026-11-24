@@ -1,0 +1,77 @@
+name: create-vm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  actions: write
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Configure OCI credentials
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_SSH_PUB_KEY: ${{ secrets.OCI_SSH_PUB_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          printf '%s\n' "$OCI_SSH_PUB_KEY" > ssh_key.pub
+
+      - name: Try to launch VM
+        env:
+          OCI_COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+          OCI_AD: ${{ secrets.OCI_AD }}
+          OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
+          OCI_IMAGE: ${{ secrets.OCI_IMAGE }}
+          SSH_KEY_FILE: ${{ github.workspace }}/ssh_key.pub
+          RETRY_INTERVAL: "45"
+          MAX_DURATION: "420"
+          LOG_FILE: ${{ github.workspace }}/create-vm.log
+        run: |
+          # exit 2 (pas de capacité) = attendu, le job reste vert
+          ./create-vm.sh || code=$? && [ "${code:-0}" -ne 1 ] || exit 1
+
+      - name: Notify and disable on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! grep -q "VM CRÉÉE" create-vm.log; then
+            echo "Pas encore de capacité, prochaine tentative au prochain cron."
+            exit 0
+          fi
+          ip=$(grep "IP publique" create-vm.log | tail -1 | awk '{print $NF}')
+          instance=$(grep "Instance :" create-vm.log | tail -1 | awk '{print $NF}')
+          gh issue create \
+            --title "VM Always Free créée : $ip" \
+            --body "La VM **vm-free-arm** (2 OCPU / 12 Go / 150 Go) a été obtenue !
+
+          - Instance : \`${instance}\`
+          - IP publique : \`${ip}\`
+          - Connexion : \`ssh ubuntu@${ip}\` (clé privée = celle correspondant à la clé publique fournie)
+
+          Le workflow planifié a été désactivé automatiquement. Réactive-le (Actions → create-vm → Enable workflow) si tu recrées une VM plus tard." || true
+          gh workflow disable "create-vm.yml"
